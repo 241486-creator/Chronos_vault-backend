@@ -5,20 +5,28 @@ require('dotenv').config();
 
 const app = express();
 
-// Middleware
-app.use(cors());
 app.use(express.json());
+
+// CORS Settings - FIXED
+app.use(cors({
+    origin: [
+        "https://chronos-vault-ultimate-v1.vercel.app",
+        "https://frontend-seven-iota-99.vercel.app"
+    ],
+    methods: ["GET", "POST"],
+    credentials: true
+}));
 
 // Aiven PostgreSQL Connection
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: {
-        rejectUnauthorized: false // SSL certificate fix for Aiven
+        rejectUnauthorized: false
     }
 });
 
 // ==========================================
-// 1. DATABASE SETUP ROUTE (Run this once!)
+// 1. DATABASE SETUP (Run once: /setup-db)
 // ==========================================
 app.get('/setup-db', async (req, res) => {
     try {
@@ -31,7 +39,7 @@ app.get('/setup-db', async (req, res) => {
                 username TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
-                heir_email TEXT NOT NULL,
+                heir_email TEXT,
                 dead_man_switch_days INT DEFAULT 30,
                 last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 is_released BOOLEAN DEFAULT FALSE
@@ -39,49 +47,66 @@ app.get('/setup-db', async (req, res) => {
 
             CREATE TABLE vault_data (
                 id SERIAL PRIMARY KEY,
-                user_id INT REFERENCES users(id) ON DELETE CASCADE,
-                site_name TEXT NOT NULL,
-                secret_content TEXT NOT NULL,
+                user_id INT REFERENCES users(id),
+                site_name TEXT,
+                secret_content TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        res.send("<h1>Chronos Vault: Database Setup Successful!</h1><p>Tables 'users' and 'vault_data' have been created.</p>");
+        res.json({ message: "DATABASE_CLEANED_AND_REBUILT" });
     } catch (err) {
-        res.status(500).send("Error setting up DB: " + err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 
 // ==========================================
-// 2. USER AUTHENTICATION ROUTES
+// 2. AUTH ROUTES (Register & Login)
 // ==========================================
 
-// Signup Route
 app.post('/register', async (req, res) => {
-    const { username, email, password, heir_email, switch_days } = req.body;
+    const { username, email, password, heir_email } = req.body;
+
+    console.log("Registering User:", { username, email, password, heir_email });
+
+    if (!username || !email || !password || !heir_email) {
+        return res.status(400).json({ error: "ALL_FIELDS_REQUIRED" });
+    }
+
     try {
         const result = await pool.query(
-            'INSERT INTO users (username, email, password_hash, heir_email, dead_man_switch_days) VALUES ($1, $2, $3, $4, $5) RETURNING id',
-            [username, email, password, heir_email, switch_days || 30]
+            'INSERT INTO users (username, email, password_hash, heir_email) VALUES ($1, $2, $3, $4) RETURNING *',
+            [username, email, password, heir_email]
         );
-        res.status(201).json({ message: "User Registered", userId: result.rows[0].id });
+
+        console.log("User Created:", result.rows[0].id);
+        res.status(201).json({ message: "ACCESS_GRANTED", user: result.rows[0] });
+
     } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Registration failed. Email/Username might already exist." });
+        console.error("DB Error:", err.message);
+        if (err.code === '23505') {
+            res.status(400).json({ error: "IDENTITY_TAKEN" });
+        } else {
+            res.status(500).json({ error: "AUTH_FAILED" });
+        }
     }
 });
 
-// Login Route (Simple Version)
+// LOGIN
 app.post('/login', async (req, res) => {
     const { email, password } = req.body;
     try {
-        const result = await pool.query(
-            'SELECT id, username, email, heir_email FROM users WHERE email = $1 AND password_hash = $2',
-            [email, password]
-        );
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
+
         if (result.rows.length > 0) {
-            res.json({ message: "Login Successful", user: result.rows[0] });
+            const user = result.rows[0];
+            if (user.password_hash === password) {
+                await pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [user.id]);
+                res.json({ message: "LOGIN_SUCCESSFUL", user });
+            } else {
+                res.status(401).json({ error: "INVALID_CREDENTIALS" });
+            }
         } else {
-            res.status(401).json({ error: "Invalid credentials" });
+            res.status(404).json({ error: "USER_NOT_FOUND" });
         }
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -89,25 +114,9 @@ app.post('/login', async (req, res) => {
 });
 
 // ==========================================
-// 3. DEAD MAN SWITCH LOGIC
+// 3. VAULT ROUTES
 // ==========================================
 
-// "I AM ALIVE" Button (Resets the timer)
-app.post('/check-in/:userId', async (req, res) => {
-    const { userId } = req.params;
-    try {
-        await pool.query('UPDATE users SET last_seen = NOW() WHERE id = $1', [userId]);
-        res.json({ message: "Timer reset. We know you are alive!" });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-});
-
-// ==========================================
-// 4. VAULT DATA ROUTES (User-Specific)
-// ==========================================
-
-// Add Secret to Vault
 app.post('/add-secret', async (req, res) => {
     const { user_id, site_name, secret_content } = req.body;
     try {
@@ -121,7 +130,6 @@ app.post('/add-secret', async (req, res) => {
     }
 });
 
-// Get User's Private Vault
 app.get('/get-vault/:user_id', async (req, res) => {
     const { user_id } = req.params;
     try {
@@ -135,12 +143,7 @@ app.get('/get-vault/:user_id', async (req, res) => {
     }
 });
 
-// Status Route
-app.get('/', (req, res) => {
-    res.json({ status: "Chronos Vault API is Operational" });
-});
-
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+module.exports = app;
