@@ -1,9 +1,51 @@
 import React, { useState, useEffect, useRef } from 'react';
 import axios from 'axios';
+import CryptoJS from 'crypto-js';
 import './App.css';
 
 const API_URL = "https://chronos-vault-backend.vercel.app";
 
+// ==========================================
+// CLIENT-SIDE ENCRYPTION (AES-256)
+// ==========================================
+function deriveKey(password, salt) {
+  return CryptoJS.PBKDF2(password, salt, {
+    keySize: 256 / 32,
+    iterations: 10000
+  }).toString();
+}
+
+function encryptSecret(secret, password) {
+  const salt = CryptoJS.lib.WordArray.random(128 / 8).toString();
+  const key = deriveKey(password, salt);
+  const iv = CryptoJS.lib.WordArray.random(128 / 8);
+  const encrypted = CryptoJS.AES.encrypt(secret, CryptoJS.enc.Hex.parse(key), {
+    iv: iv,
+    mode: CryptoJS.mode.CBC,
+    padding: CryptoJS.pad.Pkcs7
+  });
+  return salt + ':' + iv.toString() + ':' + encrypted.toString();
+}
+
+function decryptSecret(encryptedData, password) {
+  try {
+    const [salt, ivHex, encrypted] = encryptedData.split(':');
+    const key = deriveKey(password, salt);
+    const iv = CryptoJS.enc.Hex.parse(ivHex);
+    const decrypted = CryptoJS.AES.decrypt(encrypted, CryptoJS.enc.Hex.parse(key), {
+      iv: iv,
+      mode: CryptoJS.mode.CBC,
+      padding: CryptoJS.pad.Pkcs7
+    });
+    return decrypted.toString(CryptoJS.enc.Utf8) || '[DECRYPTION_FAILED]';
+  } catch (e) {
+    return '[DECRYPTION_FAILED]';
+  }
+}
+
+// ==========================================
+// MATRIX RAIN
+// ==========================================
 const MatrixRain = () => {
   const canvasRef = useRef(null);
   useEffect(() => {
@@ -34,6 +76,9 @@ const MatrixRain = () => {
   return <canvas ref={canvasRef} className="matrix-canvas" />;
 };
 
+// ==========================================
+// WIREFRAME CUBE
+// ==========================================
 const WireframeCube = ({ size = 150, speed = 0.011 }) => {
   const canvasRef = useRef(null);
   useEffect(() => {
@@ -78,7 +123,20 @@ const WireframeCube = ({ size = 150, speed = 0.011 }) => {
   return <canvas ref={canvasRef} width={size} height={size} className="cube-canvas" style={{ width: size, height: size }} />;
 };
 
-const bootLines = ['BIOS v3.1.0 ........ OK', 'RAM 131072KB ....... OK', 'CRYPTO ENGINE ...... AES-256-GCM', 'VAULT DRIVER ....... LOADED', 'MATRIX SUBSYSTEM ... ACTIVE', 'NETWORK STACK ...... ONLINE', 'AUTH MODULE ........ READY', 'CHRONOS_VAULT OS ... BOOT COMPLETE'];
+// ==========================================
+// BOOT SCREEN
+// ==========================================
+const bootLines = [
+  'BIOS v3.1.0 ........ OK',
+  'RAM 131072KB ....... OK',
+  'CRYPTO ENGINE ...... AES-256-CBC',
+  'PBKDF2 MODULE ...... LOADED',
+  'VAULT DRIVER ....... LOADED',
+  'MATRIX SUBSYSTEM ... ACTIVE',
+  'NETWORK STACK ...... ONLINE',
+  'AUTH MODULE ........ READY',
+  'CHRONOS_VAULT OS ... BOOT COMPLETE'
+];
 
 const BootScreen = ({ onComplete }) => {
   const [lines, setLines] = useState([]);
@@ -102,6 +160,9 @@ const BootScreen = ({ onComplete }) => {
   );
 };
 
+// ==========================================
+// CLOCK
+// ==========================================
 const Clock = () => {
   const [time, setTime] = useState('');
   useEffect(() => {
@@ -116,47 +177,68 @@ const Clock = () => {
   return <span className="clock-display">{time}</span>;
 };
 
+// ==========================================
+// MAIN APP
+// ==========================================
 function App() {
   const [booted, setBooted] = useState(false);
   const [authMode, setAuthMode] = useState('LOGIN');
   const [user, setUser] = useState(null);
   const [vault, setVault] = useState([]);
-  const [formData, setFormData] = useState({ username: '', email: '', password: '', heir_email: '' });
+  const [formData, setFormData] = useState({ username: '', email: '', password: '', heir_email: '', switch_days: 30 });
   const [entry, setEntry] = useState({ site: '', secret: '' });
   const [authErr, setAuthErr] = useState('');
   const [vaultErr, setVaultErr] = useState('');
   const [loading, setLoading] = useState(false);
+  const [showSecret, setShowSecret] = useState({});
+  const [userPassword, setUserPassword] = useState(''); // For decryption
   const [nodeId] = useState('CV-' + String(Math.floor(Math.random() * 999) + 1).padStart(3, '0'));
 
-  const mask = s => s ? s.slice(0, 2) + '•'.repeat(Math.max(4, s.length - 2)) : '';
+  const isRegister = authMode !== 'LOGIN';
 
   const fetchVault = async (id) => {
-    try { const res = await axios.get(`${API_URL}/get-vault/${id}`); setVault(res.data); } catch (_) { }
+    try {
+      const res = await axios.get(`${API_URL}/get-vault/${id}`);
+      setVault(res.data);
+    } catch (_) { }
+  };
+
+  const switchMode = (mode) => {
+    setAuthMode(mode);
+    setAuthErr('');
+    setFormData({ username: '', email: '', password: '', heir_email: '', switch_days: 30 });
   };
 
   const handleAuth = async () => {
     if (!formData.email || !formData.password) { setAuthErr('> MISSING_CREDENTIALS'); return; }
     setLoading(true); setAuthErr('');
     try {
-      if (authMode === 'LOGIN') {
+      if (!isRegister) {
+        // LOGIN
         const res = await axios.post(`${API_URL}/login`, {
           email: formData.email,
-          password: formData.password   // ✅ FIXED
+          password: formData.password
         });
-        setUser(res.data.user); fetchVault(res.data.user.id);
+        setUser(res.data.user);
+        setUserPassword(formData.password); // Store for decryption
+        fetchVault(res.data.user.id);
       } else {
+        // REGISTER
         if (!formData.username) { setAuthErr('> NODE_ID_REQUIRED'); setLoading(false); return; }
+        if (!formData.heir_email) { setAuthErr('> HEIR_EMAIL_REQUIRED'); setLoading(false); return; }
         await axios.post(`${API_URL}/register`, {
           username: formData.username,
           email: formData.email,
-          password: formData.password,  // ✅ FIXED (was password_hash)
+          password: formData.password,
           heir_email: formData.heir_email,
-          switch_days: 30
+          switch_days: formData.switch_days
         });
-        setAuthMode('LOGIN');
+        switchMode('LOGIN');
         setTimeout(() => setAuthErr('> REGISTRATION_SUCCESS'), 50);
       }
-    } catch (e) { setAuthErr('> ' + (e.response?.data?.error || 'AUTH_FAILED').toUpperCase()); }
+    } catch (e) {
+      setAuthErr('> ' + (e.response?.data?.error || 'AUTH_FAILED').toUpperCase());
+    }
     setLoading(false);
   };
 
@@ -164,13 +246,52 @@ function App() {
     if (!entry.site || !entry.secret) { setVaultErr('> MISSING_FIELDS'); return; }
     setVaultErr('');
     try {
-      await axios.post(`${API_URL}/add-secret`, { user_id: user.id, site_name: entry.site, secret_content: entry.secret });
-      setEntry({ site: '', secret: '' }); fetchVault(user.id);
-    } catch (e) { setVaultErr('> ' + (e.response?.data?.error || 'ENCRYPT_FAILED').toUpperCase()); }
+      // Client-side encrypt karo before sending
+      const encryptedSecret = encryptSecret(entry.secret, userPassword);
+      await axios.post(`${API_URL}/add-secret`, {
+        user_id: user.id,
+        site_name: entry.site,
+        secret_content: encryptedSecret
+      });
+      setEntry({ site: '', secret: '' });
+      fetchVault(user.id);
+    } catch (e) {
+      setVaultErr('> ' + (e.response?.data?.error || 'ENCRYPT_FAILED').toUpperCase());
+    }
   };
 
-  const handleLogout = () => { setUser(null); setVault([]); setAuthMode('LOGIN'); };
-  const removeEntry = (i) => { const v = [...vault]; v.splice(i, 1); setVault(v); };
+  const handleDelete = async (id) => {
+    try {
+      await axios.delete(`${API_URL}/delete-secret/${id}`);
+      fetchVault(user.id);
+    } catch (e) { }
+  };
+
+  const handleUpdateSwitchDays = async (days) => {
+    try {
+      await axios.post(`${API_URL}/update-switch-days`, {
+        user_id: user.id,
+        switch_days: days
+      });
+      setUser({ ...user, dead_man_switch_days: days });
+    } catch (e) { }
+  };
+
+  const toggleSecret = (id) => {
+    setShowSecret(prev => ({ ...prev, [id]: !prev[id] }));
+  };
+
+  const getDecryptedSecret = (encryptedData) => {
+    return decryptSecret(encryptedData, userPassword);
+  };
+
+  const handleLogout = () => {
+    setUser(null);
+    setVault([]);
+    setAuthMode('LOGIN');
+    setUserPassword('');
+    setShowSecret({});
+  };
 
   useEffect(() => {
     const onKey = e => { if (e.key === 'Enter' && !user) handleAuth(); };
@@ -202,6 +323,7 @@ function App() {
       <main className="viewport">
         {!user ? (
           <div className="auth-layout">
+            {/* LEFT: CUBE */}
             <div className="cube-section">
               <div className="cube-canvas-wrap"><WireframeCube size={150} speed={0.011} /></div>
               <div className="cube-tag">ENCRYPT_ENGINE</div>
@@ -214,33 +336,124 @@ function App() {
                 <div className="stat-bar"><div className="stat-fill" style={{ width: '70%', animationDelay: '0.6s' }} /></div>
               </div>
             </div>
+
             <div className="connector" />
+
+            {/* RIGHT: AUTH CARD */}
             <div className="auth-card">
               <div className="scan-line-anim" />
-              <div className="panel-title">{authMode === 'LOGIN' ? 'ACCESS_PROTOCOL' : 'REGISTER_PROTOCOL'}</div>
-              <div className="panel-subtitle">{authMode === 'LOGIN' ? 'LOGIN TO CHRONOS VAULT' : 'CREATE NEW IDENTITY'}</div>
+              <div className="panel-title">{isRegister ? 'REGISTER_PROTOCOL' : 'ACCESS_PROTOCOL'}</div>
+              <div className="panel-subtitle">{isRegister ? 'CREATE NEW IDENTITY' : 'LOGIN TO CHRONOS VAULT'}</div>
               <div className="panel-divider" />
-              {authMode === 'SIGNUP' && <div className="input-wrap"><span className="input-icon">@</span><input className="cv-input" type="text" placeholder="NODE_IDENTIFIER" autoComplete="off" onChange={e => setFormData({ ...formData, username: e.target.value })} /></div>}
-              <div className="input-wrap"><span className="input-icon">✉</span><input className="cv-input" type="email" placeholder="EMAIL_ADDRESS" autoComplete="off" onChange={e => setFormData({ ...formData, email: e.target.value })} /></div>
-              <div className="input-wrap"><span className="input-icon">*</span><input className="cv-input" type="password" placeholder="MASTER_KEY" onChange={e => setFormData({ ...formData, password: e.target.value })} /></div>
-              {authMode === 'SIGNUP' && <div className="input-wrap"><span className="input-icon">⇒</span><input className="cv-input" type="email" placeholder="HEIR_EMAIL (optional)" autoComplete="off" onChange={e => setFormData({ ...formData, heir_email: e.target.value })} /></div>}
-              <div className="error-msg" style={{ color: authErr.includes('SUCCESS') ? '#00ff41' : '#ff4040' }}>{authErr}</div>
-              <button className="pro-btn" onClick={handleAuth} disabled={loading}>{loading ? '...' : (authMode === 'LOGIN' ? '[ EXECUTE ]' : '[ CREATE_IDENTITY ]')}</button>
+
+              {isRegister && (
+                <div className="input-wrap">
+                  <span className="input-icon">@</span>
+                  <input className="cv-input" type="text" placeholder="NODE_IDENTIFIER"
+                    autoComplete="off" value={formData.username}
+                    onChange={e => setFormData({ ...formData, username: e.target.value })} />
+                </div>
+              )}
+
+              <div className="input-wrap">
+                <span className="input-icon">✉</span>
+                <input className="cv-input" type="email" placeholder="EMAIL_ADDRESS"
+                  autoComplete="off" value={formData.email}
+                  onChange={e => setFormData({ ...formData, email: e.target.value })} />
+              </div>
+
+              <div className="input-wrap">
+                <span className="input-icon">*</span>
+                <input className="cv-input" type="password" placeholder="MASTER_KEY"
+                  value={formData.password}
+                  onChange={e => setFormData({ ...formData, password: e.target.value })} />
+              </div>
+
+              {isRegister && (
+                <>
+                  <div className="input-wrap">
+                    <span className="input-icon">⇒</span>
+                    <input className="cv-input" type="email" placeholder="HEIR_EMAIL"
+                      autoComplete="off" value={formData.heir_email}
+                      onChange={e => setFormData({ ...formData, heir_email: e.target.value })} />
+                  </div>
+
+                  {/* SWITCH DAYS SELECTOR */}
+                  <div className="switch-days-wrap">
+                    <span className="switch-label">DEAD_MAN_SWITCH:</span>
+                    <div className="days-btns">
+                      {[1, 10, 30].map(d => (
+                        <button key={d}
+                          className={`day-btn ${formData.switch_days === d ? 'active' : ''}`}
+                          onClick={() => setFormData({ ...formData, switch_days: d })}>
+                          {d}D
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </>
+              )}
+
+              <div className="error-msg" style={{ color: authErr.includes('SUCCESS') ? '#00ff41' : '#ff4040' }}>
+                {authErr}
+              </div>
+
+              <button className="pro-btn" onClick={handleAuth} disabled={loading}>
+                {loading ? '...' : (isRegister ? '[ CREATE_IDENTITY ]' : '[ EXECUTE ]')}
+              </button>
+
               <div className="toggle">
-                {authMode === 'LOGIN' ? <>{'> NEW_NODE? '}<span onClick={() => { setAuthMode('SIGNUP'); setAuthErr(''); }}>REGISTER</span></> : <>{'> HAVE_ACCESS? '}<span onClick={() => { setAuthMode('LOGIN'); setAuthErr(''); }}>LOGIN</span></>}
+                {!isRegister
+                  ? <>{'> NEW_NODE? '}<span onClick={() => switchMode('REGISTER')}>REGISTER</span></>
+                  : <>{'> HAVE_ACCESS? '}<span onClick={() => switchMode('LOGIN')}>LOGIN</span></>
+                }
               </div>
             </div>
           </div>
+
         ) : (
           <div className="dashboard">
             <div className="side-ctrl">
               <div className="dash-title">ENCRYPT_DATA</div>
               <div className="dp-cube-wrap"><WireframeCube size={90} speed={0.016} /></div>
-              <div className="input-wrap"><span className="input-icon">$</span><input className="cv-input" type="text" placeholder="SITE_NAME" autoComplete="off" value={entry.site} onChange={e => setEntry({ ...entry, site: e.target.value.toUpperCase() })} /></div>
-              <div className="input-wrap"><span className="input-icon">*</span><input className="cv-input" type="password" placeholder="SECRET_DATA" value={entry.secret} onChange={e => setEntry({ ...entry, secret: e.target.value })} /></div>
+
+              <div className="input-wrap">
+                <span className="input-icon">$</span>
+                <input className="cv-input" type="text" placeholder="SITE_NAME"
+                  autoComplete="off" value={entry.site}
+                  onChange={e => setEntry({ ...entry, site: e.target.value.toUpperCase() })} />
+              </div>
+              <div className="input-wrap">
+                <span className="input-icon">*</span>
+                <input className="cv-input" type="password" placeholder="SECRET_DATA"
+                  value={entry.secret}
+                  onChange={e => setEntry({ ...entry, secret: e.target.value })} />
+              </div>
               <div className="error-msg">{vaultErr}</div>
-              <button className="pro-btn" onClick={handleEncrypt} style={{ marginTop: 'auto' }}>[ ENCRYPT + STORE ]</button>
+
+              <button className="pro-btn" onClick={handleEncrypt} style={{ marginTop: '10px' }}>
+                [ ENCRYPT + STORE ]
+              </button>
+
+              {/* SWITCH DAYS UPDATE */}
+              <div className="switch-days-wrap" style={{ marginTop: '20px' }}>
+                <span className="switch-label">DEAD_SWITCH:</span>
+                <div className="days-btns">
+                  {[1, 10, 30].map(d => (
+                    <button key={d}
+                      className={`day-btn ${user.dead_man_switch_days === d ? 'active' : ''}`}
+                      onClick={() => handleUpdateSwitchDays(d)}>
+                      {d}D
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div style={{ fontSize: '0.6rem', color: 'rgba(0,255,65,0.4)', marginTop: '8px' }}>
+                HEIR: {user.heir_email || 'NOT_SET'}
+              </div>
             </div>
+
             <div className="data-log">
               <div className="dash-title">VAULT_CONTENTS</div>
               <div className="meta-row">
@@ -248,13 +461,23 @@ function App() {
                 <div className="meta-item">USER: <span>{(user.username || user.email.split('@')[0]).toUpperCase()}</span></div>
               </div>
               <div className="log-list">
-                {vault.length === 0 ? <div className="empty-msg">:: VAULT_EMPTY ::</div> : vault.map((v, i) => (
-                  <div key={i} className="log-row">
-                    <span className="entry-site">{(v.site_name || '?').slice(0, 16)}</span>
-                    <span className="entry-secret">{mask(v.secret_content)}</span>
-                    <button className="del-btn" onClick={() => removeEntry(i)}>✕</button>
-                  </div>
-                ))}
+                {vault.length === 0
+                  ? <div className="empty-msg">:: VAULT_EMPTY ::</div>
+                  : vault.map((v) => (
+                    <div key={v.id} className="log-row">
+                      <span className="entry-site">{(v.site_name || '?').slice(0, 14)}</span>
+                      <span className="entry-secret">
+                        {showSecret[v.id]
+                          ? getDecryptedSecret(v.secret_content)
+                          : '••••••••'}
+                      </span>
+                      <button className="eye-btn" onClick={() => toggleSecret(v.id)}>
+                        {showSecret[v.id] ? '🔒' : '👁'}
+                      </button>
+                      <button className="del-btn" onClick={() => handleDelete(v.id)}>✕</button>
+                    </div>
+                  ))
+                }
               </div>
             </div>
           </div>
@@ -268,4 +491,4 @@ function App() {
   );
 }
 
-export default App; 
+export default App;

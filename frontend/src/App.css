@@ -709,3 +709,60 @@
   width: 0%;
   transition: width 0.22s;
 }
+
+/* SWITCH DAYS */
+.switch-days-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.switch-label {
+  font-size: 0.6rem;
+  color: rgba(0, 255, 65, 0.6);
+  letter-spacing: 1px;
+}
+
+.days-btns {
+  display: flex;
+  gap: 6px;
+}
+
+.day-btn {
+  background: transparent;
+  border: 1px solid rgba(0, 255, 65, 0.4);
+  color: rgba(0, 255, 65, 0.6);
+  font-family: 'Share Tech Mono', monospace;
+  font-size: 0.65rem;
+  padding: 4px 8px;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.day-btn:hover {
+  border-color: #00ff41;
+  color: #00ff41;
+}
+
+.day-btn.active {
+  background: #00ff41;
+  color: #000;
+  border-color: #00ff41;
+  font-weight: bold;
+}
+
+/* EYE BUTTON */
+.eye-btn {
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  font-size: 0.75rem;
+  padding: 2px 4px;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.eye-btn:hover {
+  opacity: 1;
+}
