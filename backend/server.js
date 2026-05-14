@@ -3,7 +3,6 @@ const { Pool } = require('pg');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const nodemailer = require('nodemailer');
-const cron = require('node-cron');
 const crypto = require('crypto');
 require('dotenv').config();
 
@@ -44,7 +43,7 @@ const transporter = nodemailer.createTransport({
 });
 
 // ==========================================
-// ENCRYPTION HELPERS (Server-side for heir email)
+// ENCRYPTION HELPERS
 // ==========================================
 const ENCRYPTION_KEY = process.env.ENCRYPTION_SECRET || crypto.randomBytes(32).toString('hex');
 
@@ -59,15 +58,17 @@ function encryptData(text) {
 
 function decryptData(encryptedText) {
     try {
-        const [ivHex, encrypted] = encryptedText.split(':');
-        const iv = Buffer.from(ivHex, 'hex');
+        const parts = encryptedText.split(':');
+        if (parts.length < 2) return encryptedText; // purana plain text
+        const iv = Buffer.from(parts[0], 'hex');
+        const encrypted = parts.slice(1).join(':');
         const key = Buffer.from(ENCRYPTION_KEY.slice(0, 32).padEnd(32, '0'));
         const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
         let decrypted = decipher.update(encrypted, 'hex', 'utf8');
         decrypted += decipher.final('utf8');
         return decrypted;
     } catch (e) {
-        return '[DECRYPTION_FAILED]';
+        return encryptedText; // agar decrypt fail ho toh as-is return karo
     }
 }
 
@@ -117,24 +118,20 @@ app.post('/register', async (req, res) => {
     }
 
     try {
-        // bcrypt se password hash karo
         const saltRounds = 12;
         const password_hash = await bcrypt.hash(password, saltRounds);
-
         const days = switch_days || 30;
 
         const result = await pool.query(
             `INSERT INTO users 
              (username, email, password_hash, heir_email, dead_man_switch_days) 
-             VALUES ($1, $2, $3, $4, $5) RETURNING id, username, email, heir_email, dead_man_switch_days`,
+             VALUES ($1, $2, $3, $4, $5) 
+             RETURNING id, username, email, heir_email, dead_man_switch_days`,
             [username, email, password_hash, heir_email, days]
         );
 
-        console.log("User Created:", result.rows[0].id);
         res.status(201).json({ message: "ACCESS_GRANTED", user: result.rows[0] });
-
     } catch (err) {
-        console.error("Register Error:", err.message);
         if (err.code === '23505') {
             res.status(400).json({ error: "IDENTITY_TAKEN" });
         } else {
@@ -154,35 +151,28 @@ app.post('/login', async (req, res) => {
     }
 
     try {
-        const result = await pool.query(
-            'SELECT * FROM users WHERE email = $1', [email]
-        );
+        const result = await pool.query('SELECT * FROM users WHERE email = $1', [email]);
 
         if (result.rows.length === 0) {
             return res.status(404).json({ error: "USER_NOT_FOUND" });
         }
 
         const user = result.rows[0];
-
-        // bcrypt se password verify karo
         const isValid = await bcrypt.compare(password, user.password_hash);
 
         if (!isValid) {
             return res.status(401).json({ error: "INVALID_CREDENTIALS" });
         }
 
-        // last_seen update karo
         await pool.query(
             'UPDATE users SET last_seen = NOW(), switch_triggered = FALSE WHERE id = $1',
             [user.id]
         );
 
-        // Password hash return mat karo
         const { password_hash, ...safeUser } = user;
         res.json({ message: "LOGIN_SUCCESSFUL", user: safeUser });
 
     } catch (err) {
-        console.error("Login Error:", err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -204,7 +194,7 @@ app.post('/update-switch-days', async (req, res) => {
 });
 
 // ==========================================
-// VAULT - ADD SECRET (Encrypted)
+// VAULT - ADD SECRET
 // ==========================================
 app.post('/add-secret', async (req, res) => {
     const { user_id, site_name, secret_content } = req.body;
@@ -214,9 +204,7 @@ app.post('/add-secret', async (req, res) => {
     }
 
     try {
-        // Secret ko encrypt karke store karo
         const encryptedSecret = encryptData(secret_content);
-
         const result = await pool.query(
             'INSERT INTO vault_data (user_id, site_name, secret_content) VALUES ($1, $2, $3) RETURNING *',
             [user_id, site_name, encryptedSecret]
@@ -228,7 +216,7 @@ app.post('/add-secret', async (req, res) => {
 });
 
 // ==========================================
-// VAULT - GET SECRETS (Decrypted)
+// VAULT - GET SECRETS
 // ==========================================
 app.get('/get-vault/:user_id', async (req, res) => {
     const { user_id } = req.params;
@@ -237,13 +225,10 @@ app.get('/get-vault/:user_id', async (req, res) => {
             'SELECT * FROM vault_data WHERE user_id = $1 ORDER BY created_at DESC',
             [user_id]
         );
-
-        // Decrypt karke bhejo
         const decryptedVault = result.rows.map(row => ({
             ...row,
             secret_content: decryptData(row.secret_content)
         }));
-
         res.json(decryptedVault);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -264,48 +249,17 @@ app.delete('/delete-secret/:id', async (req, res) => {
 });
 
 // ==========================================
-// SEND HEIR EMAIL FUNCTION
+// DEAD MAN'S SWITCH - CRON ENDPOINT
+// Vercel Cron daily call karega is endpoint ko
 // ==========================================
-async function sendHeirEmail(user, secrets) {
-    const secretsList = secrets.map((s, i) =>
-        `${i + 1}. ${s.site_name}: ${decryptData(s.secret_content)}`
-    ).join('\n');
+app.get('/cron/check-switch', async (req, res) => {
+    // Verify cron secret
+    const authHeader = req.headers['authorization'];
+    if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+        return res.status(401).json({ error: "UNAUTHORIZED" });
+    }
 
-    const mailOptions = {
-        from: `"ChronosVault System" <${process.env.GMAIL_USER}>`,
-        to: user.heir_email,
-        subject: `⚠️ ChronosVault: ${user.username} ke secrets - Dead Man's Switch Triggered`,
-        html: `
-        <div style="font-family: monospace; background: #000; color: #00ff41; padding: 30px; border: 1px solid #00ff41;">
-            <h1 style="color: #00ff41; letter-spacing: 5px;">CHRONOS_VAULT</h1>
-            <h2 style="color: #ff4040;">⚠️ DEAD MAN'S SWITCH TRIGGERED</h2>
-            <p style="color: #ccc;">
-                User <strong style="color: #00ff41;">${user.username}</strong> (${user.email}) 
-                ne <strong>${user.dead_man_switch_days} din</strong> se login nahi kiya.
-            </p>
-            <p style="color: #ccc;">Aap ko heir designate kiya gaya tha. Yeh saare encrypted secrets hain:</p>
-            <div style="background: #001100; padding: 20px; border: 1px solid #00ff41; margin: 20px 0;">
-                <pre style="color: #00ff41;">${secretsList || 'Koi secrets nahi hain.'}</pre>
-            </div>
-            <p style="color: #888; font-size: 12px;">
-                Yeh email automatically bheja gaya hai ChronosVault Dead Man's Switch system se.<br>
-                Agar user wapas aa jaye toh system reset ho jayega.
-            </p>
-        </div>
-        `
-    };
-
-    await transporter.sendMail(mailOptions);
-    console.log(`Heir email sent to: ${user.heir_email}`);
-}
-
-// ==========================================
-// DEAD MAN'S SWITCH - CRON JOB (Daily check)
-// ==========================================
-cron.schedule('0 0 * * *', async () => {
-    console.log('Running Dead Man\'s Switch check...');
     try {
-        // Jin users ne switch_days se zyada din se login nahi kiya
         const result = await pool.query(`
             SELECT * FROM users 
             WHERE heir_email IS NOT NULL 
@@ -314,47 +268,68 @@ cron.schedule('0 0 * * *', async () => {
             AND last_seen < NOW() - (dead_man_switch_days || ' days')::INTERVAL
         `);
 
-        console.log(`Found ${result.rows.length} triggered users`);
-
+        let triggered = 0;
         for (const user of result.rows) {
             try {
-                // Secrets fetch karo
                 const secrets = await pool.query(
-                    'SELECT * FROM vault_data WHERE user_id = $1',
-                    [user.id]
+                    'SELECT * FROM vault_data WHERE user_id = $1', [user.id]
                 );
-
-                // Heir ko email bhejo
                 await sendHeirEmail(user, secrets.rows);
-
-                // Mark as triggered
                 await pool.query(
-                    'UPDATE users SET switch_triggered = TRUE WHERE id = $1',
-                    [user.id]
+                    'UPDATE users SET switch_triggered = TRUE WHERE id = $1', [user.id]
                 );
-
-                console.log(`Switch triggered for user: ${user.username}`);
-            } catch (emailErr) {
-                console.error(`Email failed for ${user.username}:`, emailErr.message);
+                triggered++;
+            } catch (e) {
+                console.error(`Email failed for ${user.username}:`, e.message);
             }
         }
+        res.json({ message: "CRON_COMPLETE", triggered });
     } catch (err) {
-        console.error('Cron job error:', err.message);
+        res.status(500).json({ error: err.message });
     }
 });
 
 // ==========================================
-// MANUAL TRIGGER TEST (for testing)
+// SEND HEIR EMAIL
+// ==========================================
+async function sendHeirEmail(user, secrets) {
+    const secretsList = secrets.map((s, i) =>
+        `${i + 1}. ${s.site_name}: ${decryptData(s.secret_content)}`
+    ).join('\n');
+
+    await transporter.sendMail({
+        from: `"ChronosVault System" <${process.env.GMAIL_USER}>`,
+        to: user.heir_email,
+        subject: `⚠️ ChronosVault: ${user.username} ke secrets - Dead Man's Switch Triggered`,
+        html: `
+        <div style="font-family:monospace;background:#000;color:#00ff41;padding:30px;border:1px solid #00ff41;">
+            <h1 style="color:#00ff41;letter-spacing:5px;">CHRONOS_VAULT</h1>
+            <h2 style="color:#ff4040;">⚠️ DEAD MAN'S SWITCH TRIGGERED</h2>
+            <p style="color:#ccc;">
+                User <strong style="color:#00ff41;">${user.username}</strong> (${user.email}) 
+                ne <strong>${user.dead_man_switch_days} din</strong> se login nahi kiya.
+            </p>
+            <p style="color:#ccc;">Aap ko heir designate kiya gaya tha. Yeh saare secrets hain:</p>
+            <div style="background:#001100;padding:20px;border:1px solid #00ff41;margin:20px 0;">
+                <pre style="color:#00ff41;">${secretsList || 'Koi secrets nahi hain.'}</pre>
+            </div>
+            <p style="color:#888;font-size:12px;">
+                Yeh email automatically bheja gaya hai ChronosVault Dead Man's Switch system se.
+            </p>
+        </div>`
+    });
+}
+
+// ==========================================
+// TEST HEIR EMAIL
 // ==========================================
 app.post('/test-heir-email/:user_id', async (req, res) => {
     const { user_id } = req.params;
     try {
         const userResult = await pool.query('SELECT * FROM users WHERE id = $1', [user_id]);
         if (userResult.rows.length === 0) return res.status(404).json({ error: "USER_NOT_FOUND" });
-
         const user = userResult.rows[0];
         const secrets = await pool.query('SELECT * FROM vault_data WHERE user_id = $1', [user_id]);
-
         await sendHeirEmail(user, secrets.rows);
         res.json({ message: "TEST_EMAIL_SENT" });
     } catch (err) {
@@ -363,9 +338,9 @@ app.post('/test-heir-email/:user_id', async (req, res) => {
 });
 
 // ==========================================
-// SERVER START
+// SERVER
 // ==========================================
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`ChronosVault Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`ChronosVault Server on port ${PORT}`));
 
 module.exports = app;
