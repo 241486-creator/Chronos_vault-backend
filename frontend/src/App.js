@@ -432,7 +432,19 @@ function App() {
               <div className="error-msg">{vaultErr}</div>
 
               <button className="pro-btn" onClick={handleEncrypt} style={{ marginTop: '10px' }}>
+
                 [ ENCRYPT + STORE ]
+              </button>
+              <button className="pro-btn" onClick={async () => {
+                try {
+                  await axios.post(`${API_URL}/login`, {
+                    email: user.email,
+                    password: userPassword
+                  });
+                  alert('✅ I AM ALIVE - Switch Reset!');
+                } catch(e) {}
+              }} style={{ marginTop:'10px', borderColor:'#00ff41', background:'rgba(0,255,65,0.1)' }}>
+                [ I_AM_ALIVE ]
               </button>
 
               {/* SWITCH DAYS UPDATE */}
